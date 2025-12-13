@@ -9,7 +9,13 @@ import os
 import time
 from functools import wraps
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add airflow directory to path for imports
+airflow_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if airflow_dir not in sys.path:
+    sys.path.insert(0, airflow_dir)
+# Also ensure current directory is in path
+if os.getcwd() not in sys.path:
+    sys.path.insert(0, os.getcwd())
 
 from config.azure_config import (
     AZURE_STORAGE_ACCOUNTS,
@@ -157,234 +163,259 @@ def discover_azure_blobs(**context):
                         
                         logger.info('FN:discover_azure_blobs container_name:{} folder_path:{} blob_count:{}'.format(container_name, folder_path, len(blobs)))
                         
-                        for blob_info in blobs:
-                            try:
-                                blob_path = blob_info["full_path"]
-                                
-                                # Use retry wrapper for database read operations
-                                existing_record = retry_db_operation(max_retries=None, base_delay=1.0, max_delay=60.0, max_total_time=3600.0)(
-                                    check_file_exists
-                                )(
-                                    storage_type="azure_blob",
-                                    storage_identifier=account_name,
-                                    storage_path=blob_path
-                                )
-                                
-                                # Use ETag for all files - no need to download for hash
-                                file_size = blob_info.get("size", 0)
-                                etag = blob_info.get("etag", "").strip('"')
-                                last_modified = blob_info.get("last_modified")
-                                
-                                # Create composite hash from ETag + size + last_modified (no download needed)
-                                composite_string = f"{etag}_{file_size}_{last_modified.isoformat() if last_modified else ''}"
-                                file_hash = generate_file_hash(composite_string.encode('utf-8'))
-                                
-                                # Get ONLY headers/column names - NO data rows (banking compliance)
-                                # CSV/JSON: First 1KB (just headers/keys - NO data)
-                                # Parquet: Last 8KB (schema metadata is at the end - column names only)
-                                file_sample = None
-                                file_extension = blob_info["name"].split(".")[-1].lower() if "." in blob_info["name"] else ""
-                                
+                        # OPTIMIZATION: Process files in batches to avoid memory issues and timeouts
+                        batch_size = 100  # Process 100 files at a time
+                        total_processed = 0
+                        total_skipped = 0
+                        total_new = 0
+                        
+                        for batch_start in range(0, len(blobs), batch_size):
+                            batch_end = min(batch_start + batch_size, len(blobs))
+                            batch = blobs[batch_start:batch_end]
+                            
+                            logger.info('FN:discover_azure_blobs processing_batch:{}-{} of {}'.format(batch_start, batch_end, len(blobs)))
+                            
+                            for blob_info in batch:
                                 try:
-                                    if file_extension == "parquet":
-                                        # Parquet metadata is at the end - get tail (column names only)
-                                        file_sample = blob_client.get_blob_tail(container_name, blob_path, max_bytes=8192)
-                                        logger.info('FN:discover_azure_blobs blob_path:{} file_extension:{} sample_bytes:{}'.format(blob_path, file_extension, len(file_sample)))
+                                    blob_path = blob_info["full_path"]
+                                    
+                                    # Use retry wrapper for database read operations
+                                    existing_record = retry_db_operation(max_retries=None, base_delay=1.0, max_delay=60.0, max_total_time=3600.0)(
+                                        check_file_exists
+                                    )(
+                                        storage_type="azure_blob",
+                                        storage_identifier=account_name,
+                                        storage_path=blob_path
+                                    )
+                                    
+                                    # Use ETag for all files - no need to download for hash
+                                    file_size = blob_info.get("size", 0)
+                                    etag = blob_info.get("etag", "").strip('"')
+                                    last_modified = blob_info.get("last_modified")
+                                    
+                                    # Create composite hash from ETag + size + last_modified (no download needed)
+                                    composite_string = f"{etag}_{file_size}_{last_modified.isoformat() if last_modified else ''}"
+                                    file_hash = generate_file_hash(composite_string.encode('utf-8'))
+                                    
+                                    # Get ONLY headers/column names - NO data rows (banking compliance)
+                                    # CSV/JSON: First 1KB (just headers/keys - NO data)
+                                    # Parquet: Last 8KB (schema metadata is at the end - column names only)
+                                    file_sample = None
+                                    file_extension = blob_info["name"].split(".")[-1].lower() if "." in blob_info["name"] else ""
+                                    
+                                    try:
+                                        if file_extension == "parquet":
+                                            # Parquet metadata is at the end - get tail (column names only)
+                                            file_sample = blob_client.get_blob_tail(container_name, blob_path, max_bytes=8192)
+                                            logger.info('FN:discover_azure_blobs blob_path:{} file_extension:{} sample_bytes:{}'.format(blob_path, file_extension, len(file_sample)))
+                                        else:
+                                            # CSV/JSON: Just need headers/keys from the beginning - NO data rows
+                                            file_sample = blob_client.get_blob_sample(container_name, blob_path, max_bytes=1024)
+                                            logger.info('FN:discover_azure_blobs blob_path:{} file_extension:{} sample_bytes:{}'.format(blob_path, file_extension, len(file_sample)))
+                                    except Exception as e:
+                                        logger.warning('FN:discover_azure_blobs blob_path:{} error:{}'.format(blob_path, str(e)))
+                                    
+                                    # Use ETag-based hash for all files (no full download)
+                                    # Extract schema from sample if available
+                                    if file_sample:
+                                        metadata = extract_file_metadata(blob_info, file_sample)
+                                        schema_hash = metadata.get("schema_hash", generate_schema_hash({}))
                                     else:
-                                        # CSV/JSON: Just need headers/keys from the beginning - NO data rows
-                                        file_sample = blob_client.get_blob_sample(container_name, blob_path, max_bytes=1024)
-                                        logger.info('FN:discover_azure_blobs blob_path:{} file_extension:{} sample_bytes:{}'.format(blob_path, file_extension, len(file_sample)))
-                                except Exception as e:
-                                    logger.warning('FN:discover_azure_blobs blob_path:{} error:{}'.format(blob_path, str(e)))
-                                
-                                # Use ETag-based hash for all files (no full download)
-                                # Extract schema from sample if available
-                                if file_sample:
-                                    metadata = extract_file_metadata(blob_info, file_sample)
-                                    schema_hash = metadata.get("schema_hash", generate_schema_hash({}))
-                                else:
-                                    # No sample available, create minimal metadata
-                                    schema_hash = generate_schema_hash({})
-                                    metadata = {
-                                        "file_metadata": {
-                                            "basic": {
-                                                "name": blob_info["name"],
-                                                "extension": "." + blob_info["name"].split(".")[-1] if "." in blob_info["name"] else "",
-                                                "format": blob_info["name"].split(".")[-1].lower() if "." in blob_info["name"] else "unknown",
-                                                "size_bytes": file_size,
-                                                "content_type": blob_info.get("content_type", "application/octet-stream"),
-                                                "mime_type": blob_info.get("content_type", "application/octet-stream")
+                                        # No sample available, create minimal metadata
+                                        schema_hash = generate_schema_hash({})
+                                        metadata = {
+                                            "file_metadata": {
+                                                "basic": {
+                                                    "name": blob_info["name"],
+                                                    "extension": "." + blob_info["name"].split(".")[-1] if "." in blob_info["name"] else "",
+                                                    "format": blob_info["name"].split(".")[-1].lower() if "." in blob_info["name"] else "unknown",
+                                                    "size_bytes": file_size,
+                                                    "content_type": blob_info.get("content_type", "application/octet-stream"),
+                                                    "mime_type": blob_info.get("content_type", "application/octet-stream")
+                                                },
+                                                "hash": {
+                                                    "algorithm": "shake128_etag_composite",
+                                                    "value": file_hash,
+                                                    "computed_at": datetime.utcnow().isoformat() + "Z",
+                                                    "source": "etag_composite"
+                                                },
+                                                "timestamps": {
+                                                    "created_at": blob_info["created_at"].isoformat() if blob_info.get("created_at") else None,
+                                                    "last_modified": blob_info["last_modified"].isoformat() if blob_info.get("last_modified") else None
+                                                }
                                             },
-                                            "hash": {
-                                                "algorithm": "shake128_etag_composite",
-                                                "value": file_hash,
-                                                "computed_at": datetime.utcnow().isoformat() + "Z",
-                                                "source": "etag_composite"
-                                            },
-                                            "timestamps": {
-                                                "created_at": blob_info["created_at"].isoformat() if blob_info.get("created_at") else None,
-                                                "last_modified": blob_info["last_modified"].isoformat() if blob_info.get("last_modified") else None
-                                            }
-                                        },
-                                        "schema_json": {},
-                                        "schema_hash": schema_hash,
-                                        "file_hash": file_hash,
-                                        "storage_metadata": {
-                                            "azure": {
-                                                "type": blob_info.get("blob_type", "Block blob"),
-                                                "etag": etag,
-                                                "access_tier": blob_info.get("access_tier"),
-                                                "creation_time": blob_info["created_at"].isoformat() if blob_info.get("created_at") else None,
-                                                "last_modified": blob_info["last_modified"].isoformat() if blob_info.get("last_modified") else None,
-                                                "lease_status": blob_info.get("lease_status"),
-                                                "content_encoding": blob_info.get("content_encoding"),
-                                                "content_language": blob_info.get("content_language"),
-                                                "cache_control": blob_info.get("cache_control"),
-                                                "metadata": blob_info.get("metadata", {})
+                                            "schema_json": {},
+                                            "schema_hash": schema_hash,
+                                            "file_hash": file_hash,
+                                            "storage_metadata": {
+                                                "azure": {
+                                                    "type": blob_info.get("blob_type", "Block blob"),
+                                                    "etag": etag,
+                                                    "access_tier": blob_info.get("access_tier"),
+                                                    "creation_time": blob_info["created_at"].isoformat() if blob_info.get("created_at") else None,
+                                                    "last_modified": blob_info["last_modified"].isoformat() if blob_info.get("last_modified") else None,
+                                                    "lease_status": blob_info.get("lease_status"),
+                                                    "content_encoding": blob_info.get("content_encoding"),
+                                                    "content_language": blob_info.get("content_language"),
+                                                    "cache_control": blob_info.get("cache_control"),
+                                                    "metadata": blob_info.get("metadata", {})
+                                                }
                                             }
                                         }
+                                    
+                                    # Ensure file_hash is set
+                                    if "file_hash" not in metadata:
+                                        metadata["file_hash"] = file_hash
+                                    
+                                    file_metadata = metadata.get("file_metadata")
+                                    
+                                    should_update, schema_changed = should_update_or_insert(existing_record, file_hash, schema_hash)
+                                    
+                                    if not should_update and not existing_record:
+                                        # This shouldn't happen, but handle it
+                                        logger.warning('FN:discover_azure_blobs blob_path:{} should_update:{} existing_record:{}'.format(blob_path, should_update, bool(existing_record)))
+                                        continue
+                                    
+                                    # Skip if nothing changed (both file_hash and schema_hash are same)
+                                    if not should_update and existing_record:
+                                        total_skipped += 1
+                                        if total_skipped % 50 == 0:  # Log every 50 skipped files
+                                            logger.info('FN:discover_azure_blobs skipped_count:{}'.format(total_skipped))
+                                        continue
+                                    
+                                    storage_location = get_storage_location_json(
+                                        account_name=account_name,
+                                        container=container_name,
+                                        blob_path=blob_path
+                                    )
+                                    
+                                    discovery_info = {
+                                        "batch": {
+                                            "id": discovery_batch_id,
+                                            "started_at": batch_start_time.isoformat() + "Z"
+                                        },
+                                        "source": {
+                                            "type": "airflow_dag",
+                                            "name": "azure_blob_discovery_dag",
+                                            "run_id": run_id
+                                        },
+                                        "scan": {
+                                            "container": container_name,
+                                            "folder": folder_path
+                                        }
                                     }
-                                
-                                # Ensure file_hash is set
-                                if "file_hash" not in metadata:
-                                    metadata["file_hash"] = file_hash
-                                
-                                file_metadata = metadata.get("file_metadata")
-                                
-                                should_update, schema_changed = should_update_or_insert(existing_record, file_hash, schema_hash)
-                                
-                                if not should_update and not existing_record:
-                                    # This shouldn't happen, but handle it
-                                    logger.warning('FN:discover_azure_blobs blob_path:{} should_update:{} existing_record:{}'.format(blob_path, should_update, bool(existing_record)))
-                                    continue
-                                
-                                # Skip if nothing changed (both file_hash and schema_hash are same)
-                                if not should_update and existing_record:
-                                    logger.info('FN:discover_azure_blobs blob_path:{} existing_record_id:{}'.format(blob_path, existing_record.get('id')))
-                                    continue
-                                
-                                storage_location = get_storage_location_json(
-                                    account_name=account_name,
-                                    container=container_name,
-                                    blob_path=blob_path
-                                )
-                                
-                                discovery_info = {
-                                    "batch": {
-                                        "id": discovery_batch_id,
-                                        "started_at": batch_start_time.isoformat() + "Z"
-                                    },
-                                    "source": {
-                                        "type": "airflow_dag",
-                                        "name": "azure_blob_discovery_dag",
-                                        "run_id": run_id
-                                    },
-                                    "scan": {
-                                        "container": container_name,
-                                        "folder": folder_path
-                                    }
-                                }
-                                
-                                # Execute database write with retry logic
-                                def _execute_db_write():
-                                    conn = None
-                                    try:
-                                        conn = get_db_connection()
-                                        with conn.cursor() as cursor:
-                                            if existing_record:
-                                                if schema_changed:
-                                                    # Schema changed - update full record
-                                                    update_sql = """
-                                                        UPDATE data_discovery
-                                                        SET file_metadata = %s,
-                                                            schema_json = %s,
-                                                            schema_hash = %s,
-                                                            storage_metadata = %s,
-                                                            discovery_info = %s,
-                                                            last_checked_at = NOW(),
-                                                            updated_at = NOW()
-                                                        WHERE id = %s
+                                    
+                                    # Execute database write with retry logic
+                                    def _execute_db_write():
+                                        conn = None
+                                        try:
+                                            conn = get_db_connection()
+                                            with conn.cursor() as cursor:
+                                                if existing_record:
+                                                    if schema_changed:
+                                                        # Schema changed - update full record
+                                                        update_sql = """
+                                                            UPDATE data_discovery
+                                                            SET file_metadata = %s,
+                                                                schema_json = %s,
+                                                                schema_hash = %s,
+                                                                storage_metadata = %s,
+                                                                discovery_info = %s,
+                                                                last_checked_at = NOW(),
+                                                                updated_at = NOW()
+                                                            WHERE id = %s
+                                                        """
+                                                        cursor.execute(update_sql, (
+                                                            json.dumps(file_metadata),
+                                                            json.dumps(metadata.get("schema_json", {})),
+                                                            schema_hash,
+                                                            json.dumps(metadata.get("storage_metadata", {})),
+                                                            json.dumps(discovery_info),
+                                                            existing_record["id"]
+                                                        ))
+                                                        logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} schema_changed:{}'.format(existing_record['id'], blob_path, schema_changed))
+                                                    else:
+                                                        # Only file hash changed, not schema - just update last_checked_at
+                                                        update_sql = """
+                                                            UPDATE data_discovery
+                                                            SET last_checked_at = NOW()
+                                                            WHERE id = %s
+                                                        """
+                                                        cursor.execute(update_sql, (existing_record["id"],))
+                                                        logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} schema_changed:{}'.format(existing_record['id'], blob_path, schema_changed))
+                                                    
+                                                    discovery_id = existing_record["id"]
+                                                else:
+                                                    # New record - insert
+                                                    insert_sql = """
+                                                        INSERT INTO data_discovery (
+                                                            storage_location, file_metadata, schema_json, schema_hash,
+                                                            discovered_at, status, approval_status, is_visible, is_active,
+                                                            environment, env_type, data_source_type, folder_path,
+                                                            storage_metadata, storage_data_metadata, discovery_info,
+                                                            created_by
+                                                        ) VALUES (
+                                                            %s, %s, %s, %s,
+                                                            NOW(), 'pending', 'pending_review', TRUE, TRUE,
+                                                            %s, %s, %s, %s, %s, %s, %s, 'airflow'
+                                                        )
                                                     """
-                                                    cursor.execute(update_sql, (
+                                                    
+                                                    cursor.execute(insert_sql, (
+                                                        json.dumps(storage_location),
                                                         json.dumps(file_metadata),
                                                         json.dumps(metadata.get("schema_json", {})),
                                                         schema_hash,
+                                                        environment,
+                                                        env_type,
+                                                        data_source_type,
+                                                        folder_path,
                                                         json.dumps(metadata.get("storage_metadata", {})),
+                                                        json.dumps({}),
                                                         json.dumps(discovery_info),
-                                                        existing_record["id"]
                                                     ))
-                                                    logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} schema_changed:{}'.format(existing_record['id'], blob_path, schema_changed))
-                                                else:
-                                                    # Only file hash changed, not schema - just update last_checked_at
-                                                    update_sql = """
-                                                        UPDATE data_discovery
-                                                        SET last_checked_at = NOW()
-                                                        WHERE id = %s
-                                                    """
-                                                    cursor.execute(update_sql, (existing_record["id"],))
-                                                    logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} schema_changed:{}'.format(existing_record['id'], blob_path, schema_changed))
+                                                    
+                                                    discovery_id = cursor.lastrowid
+                                                    logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} action:insert'.format(discovery_id, blob_path))
                                                 
-                                                discovery_id = existing_record["id"]
-                                            else:
-                                                # New record - insert
-                                                insert_sql = """
-                                                    INSERT INTO data_discovery (
-                                                        storage_location, file_metadata, schema_json, schema_hash,
-                                                        discovered_at, status, approval_status, is_visible, is_active,
-                                                        environment, env_type, data_source_type, folder_path,
-                                                        storage_metadata, storage_data_metadata, discovery_info,
-                                                        created_by
-                                                    ) VALUES (
-                                                        %s, %s, %s, %s,
-                                                        NOW(), 'pending', 'pending_review', TRUE, TRUE,
-                                                        %s, %s, %s, %s, %s, %s, %s, 'airflow'
-                                                    )
-                                                """
+                                                conn.commit()
                                                 
-                                                cursor.execute(insert_sql, (
-                                                    json.dumps(storage_location),
-                                                    json.dumps(file_metadata),
-                                                    json.dumps(metadata.get("schema_json", {})),
-                                                    schema_hash,
-                                                    environment,
-                                                    env_type,
-                                                    data_source_type,
-                                                    folder_path,
-                                                    json.dumps(metadata.get("storage_metadata", {})),
-                                                    json.dumps({}),
-                                                    json.dumps(discovery_info),
-                                                ))
+                                                # Only add to new discoveries if schema changed or it's a new record
+                                                if schema_changed or not existing_record:
+                                                    total_new += 1
+                                                    all_new_discoveries.append({
+                                                        "id": discovery_id,
+                                                        "file_name": file_metadata["basic"]["name"],
+                                                        "storage_path": blob_path,
+                                                    })
                                                 
-                                                discovery_id = cursor.lastrowid
-                                                logger.info('FN:_execute_db_write discovery_id:{} blob_path:{} action:insert'.format(discovery_id, blob_path))
-                                            
-                                            conn.commit()
-                                            
-                                            # Only add to new discoveries if schema changed or it's a new record
-                                            if schema_changed or not existing_record:
-                                                all_new_discoveries.append({
-                                                    "id": discovery_id,
-                                                    "file_name": file_metadata["basic"]["name"],
-                                                    "storage_path": blob_path,
-                                                })
-                                            
-                                            return discovery_id
-                                            
-                                    except Exception as e:
-                                        if conn:
-                                            conn.rollback()
-                                        logger.error('FN:_execute_db_write blob_path:{} error:{}'.format(blob_path, str(e)))
-                                        raise
-                                    finally:
-                                        if conn:
-                                            conn.close()
-                                
-                                # Execute with retry logic
-                                retry_db_operation(max_retries=None, base_delay=1.0, max_delay=60.0, max_total_time=3600.0)(_execute_db_write)()
+                                                total_processed += 1
+                                                
+                                                # Log progress every 50 files
+                                                if total_processed % 50 == 0:
+                                                    logger.info('FN:discover_azure_blobs progress: processed={} new={} skipped={}'.format(total_processed, total_new, total_skipped))
+                                                
+                                                return discovery_id
+                                                
+                                        except Exception as e:
+                                            if conn:
+                                                conn.rollback()
+                                            logger.error('FN:_execute_db_write blob_path:{} error:{}'.format(blob_path, str(e)))
+                                            raise
+                                        finally:
+                                            if conn:
+                                                conn.close()
                                     
-                            except Exception as e:
-                                logger.error('FN:discover_azure_blobs blob_name:{} error:{}'.format(blob_info.get('name', 'unknown'), str(e)))
-                                continue
+                                    # Execute with retry logic
+                                    retry_db_operation(max_retries=None, base_delay=1.0, max_delay=60.0, max_total_time=3600.0)(_execute_db_write)()
+                                    
+                                except Exception as e:
+                                    logger.error('FN:discover_azure_blobs blob_name:{} error:{}'.format(blob_info.get('name', 'unknown'), str(e)))
+                                    total_processed += 1
+                                    continue
+                            
+                            # Log batch completion
+                            logger.info('FN:discover_azure_blobs batch_complete: processed={} new={} skipped={}'.format(total_processed, total_new, total_skipped))
                     
                     except Exception as e:
                         logger.error('FN:discover_azure_blobs folder_path:{} error:{}'.format(folder_path, str(e)))
@@ -396,8 +427,9 @@ def discover_azure_blobs(**context):
     
     batch_end_time = datetime.utcnow()
     duration_ms = int((batch_end_time - batch_start_time).total_seconds() * 1000)
+    duration_sec = duration_ms / 1000.0
     
-    logger.info('FN:discover_azure_blobs new_discoveries_count:{} duration_ms:{}'.format(len(all_new_discoveries), duration_ms))
+    logger.info('FN:discover_azure_blobs COMPLETE: new_discoveries={} duration={:.1f}s ({:.1f}ms)'.format(len(all_new_discoveries), duration_sec, duration_ms))
     return len(all_new_discoveries)
 
 
@@ -406,19 +438,22 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': True,
     'email_on_retry': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 1,  # Reduced retries to fail faster
+    'retry_delay': timedelta(minutes=2),  # Faster retry
+    'execution_timeout': timedelta(hours=2),  # 2 hour timeout for large scans
+    'task_timeout': timedelta(hours=2),  # Task-level timeout
 }
 
 dag = DAG(
     'azure_blob_discovery',
     default_args=default_args,
-    description='Discover new files in Azure Blob Storage every minute',
-    schedule_interval='*/1 * * * *',  # Every minute
+    description='Discover new files in Azure Blob Storage',
+    # Run periodically, but avoid overlapping runs on large scans.
+    schedule_interval='*/5 * * * *',  # Every 5 minutes
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    max_active_runs=10,  # Allow up to 10 DAG runs to be active
-    max_active_tasks=20,  # Allow up to 20 tasks to run simultaneously
+    max_active_runs=1,  # Prevent overlapping runs (memory + stability)
+    max_active_tasks=1,  # Process one task at a time to avoid memory exhaustion
     tags=['data-discovery', 'azure-blob'],
 )
 
@@ -426,6 +461,9 @@ discovery_task = PythonOperator(
     task_id='discover_azure_blobs',
     python_callable=discover_azure_blobs,
     dag=dag,
+    pool='default_pool',  # Use default pool
+    pool_slots=1,  # Use 1 slot to prevent resource conflicts
+    executor_config={'max_active_tis_per_dag': 1},  # Limit concurrent executions
 )
 
 notification_task = PythonOperator(

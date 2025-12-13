@@ -16,7 +16,24 @@ class AzureBlobClient:
             blobs = []
             
             prefix = folder_path.rstrip("/") + "/" if folder_path else ""
-            blob_list = container_client.list_blobs(name_starts_with=prefix)
+            # CRITICAL FIX: Convert lazy iterator to list immediately to avoid hanging
+            # The iterator can hang on pagination if there are many blobs
+            # Convert to list immediately - this will fetch all pages in one go
+            blob_list = []
+            count = 0
+            try:
+                blob_iterator = container_client.list_blobs(name_starts_with=prefix)
+                for blob in blob_iterator:
+                    blob_list.append(blob)
+                    count += 1
+                    # Safety limit: prevent infinite loops or memory issues
+                    if count > 10000:
+                        logger.warning('FN:list_blobs container_name:{} folder_path:{} hit_safety_limit:10000'.format(container_name, folder_path))
+                        break
+                logger.info('FN:list_blobs container_name:{} folder_path:{} fetched_blob_count:{}'.format(container_name, folder_path, len(blob_list)))
+            except Exception as e:
+                logger.error('FN:list_blobs container_name:{} folder_path:{} list_error:{}'.format(container_name, folder_path, str(e)))
+                raise
             
             for blob in blob_list:
                 if file_extensions:
@@ -26,8 +43,26 @@ class AzureBlobClient:
                 if blob.name.endswith('/'):
                     continue
                 
-                blob_client = container_client.get_blob_client(blob.name)
-                blob_properties = blob_client.get_blob_properties()
+                # CRITICAL FIX: Use properties directly from list_blobs() - NO extra API calls!
+                # This was causing tasks to hang/timeout. list_blobs() already has all properties we need.
+                class BlobPropertiesProxy:
+                    def __init__(self, blob_item):
+                        self.size = getattr(blob_item, 'size', 0)
+                        self.etag = getattr(blob_item, 'etag', '').strip('"') if hasattr(blob_item, 'etag') else ''
+                        self.creation_time = getattr(blob_item, 'creation_time', None)
+                        self.last_modified = getattr(blob_item, 'last_modified', None)
+                        # Content settings from blob properties
+                        content_type = getattr(blob_item, 'content_type', 'application/octet-stream')
+                        self.content_settings = type('ContentSettings', (), {
+                            'content_type': content_type,
+                            'content_encoding': getattr(blob_item, 'content_encoding', None),
+                            'content_language': getattr(blob_item, 'content_language', None),
+                            'cache_control': getattr(blob_item, 'cache_control', None),
+                        })()
+                        self.blob_tier = getattr(blob_item, 'blob_tier', None)
+                        self.lease = type('Lease', (), {'status': getattr(blob_item, 'lease_status', None)})()
+                        self.metadata = getattr(blob_item, 'metadata', {}) if hasattr(blob_item, 'metadata') else {}
+                blob_properties = BlobPropertiesProxy(blob)
                 
                 blob_type = None
                 if hasattr(blob_properties, 'blob_type'):

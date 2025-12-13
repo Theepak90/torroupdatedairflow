@@ -9,6 +9,7 @@ const API_ENDPOINTS = {
   APPROVE: (id) => `${API_BASE_URL}/api/discovery/${id}/approve`,
   REJECT: (id) => `${API_BASE_URL}/api/discovery/${id}/reject`,
   STATS: `${API_BASE_URL}/api/discovery/stats`,
+  TRIGGER_DISCOVERY: `${API_BASE_URL}/api/discovery/trigger`,
 };
 
 /**
@@ -93,6 +94,24 @@ export const rejectDiscovery = async (id, rejectedBy, rejectionReason = null) =>
  */
 export const getStats = async () => {
   const response = await fetch(API_ENDPOINTS.STATS);
+  
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+  
+  return await response.json();
+};
+
+/**
+ * Trigger manual discovery scan
+ */
+export const triggerDiscovery = async () => {
+  const response = await fetch(API_ENDPOINTS.TRIGGER_DISCOVERY, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
   
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);

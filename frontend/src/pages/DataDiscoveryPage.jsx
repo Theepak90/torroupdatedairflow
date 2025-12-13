@@ -15,7 +15,7 @@ import SummaryCards from '../components/SummaryCards';
 import DiscoveryFilters from '../components/DiscoveryFilters';
 import DiscoveryTable from '../components/DiscoveryTable';
 import DiscoveryDetailsDialog from '../components/DiscoveryDetailsDialog';
-import { getDiscoveries, getDiscoveryById, approveDiscovery, rejectDiscovery, getStats } from '../services/api';
+import { getDiscoveries, getDiscoveryById, approveDiscovery, rejectDiscovery, getStats, triggerDiscovery } from '../services/api';
 
 const DataDiscoveryPage = () => {
   const [discoveries, setDiscoveries] = useState([]);
@@ -41,6 +41,7 @@ const DataDiscoveryPage = () => {
   const [lastUpdateTime, setLastUpdateTime] = useState(null);
   const [newFilesCount, setNewFilesCount] = useState(0);
   const previousCountRef = useRef(0);
+  const [discoveryRunning, setDiscoveryRunning] = useState(false);
 
   useEffect(() => {
     fetchDiscoveries();
@@ -203,15 +204,41 @@ const DataDiscoveryPage = () => {
           <Button
             variant="outlined"
             startIcon={<Refresh />}
-            onClick={() => {
-              fetchDiscoveries();
-              fetchStats();
-              setLastUpdateTime(new Date());
-              previousCountRef.current = discoveries.length;
+            onClick={async () => {
+              try {
+                // Trigger discovery first
+                setDiscoveryRunning(true);
+                await triggerDiscovery();
+                showSnackbar('Discovery scan started. Refreshing data...', 'info');
+                
+                // Wait a moment for discovery to process
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // Then refresh the data
+                await fetchDiscoveries();
+                await fetchStats();
+                setLastUpdateTime(new Date());
+                previousCountRef.current = discoveries.length;
+                
+                // Wait a bit more and refresh again to catch new files
+                setTimeout(async () => {
+                  await fetchDiscoveries();
+                  await fetchStats();
+                  showSnackbar('Discovery complete. Data refreshed.', 'success');
+                  setDiscoveryRunning(false);
+                }, 5000);
+              } catch (error) {
+                console.error('Error triggering discovery:', error);
+                showSnackbar('Error triggering discovery: ' + error.message, 'error');
+                setDiscoveryRunning(false);
+                // Still refresh data even if discovery fails
+                fetchDiscoveries();
+                fetchStats();
+              }
             }}
-            disabled={loading}
+            disabled={loading || discoveryRunning}
           >
-            Refresh
+            {discoveryRunning ? 'Scanning...' : 'Refresh'}
           </Button>
           <Button
             variant="contained"
