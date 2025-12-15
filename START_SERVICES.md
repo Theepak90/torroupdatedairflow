@@ -43,8 +43,6 @@ cd /Users/theepak/Desktop/torroairflow/airflow
 source venv/bin/activate
 export AIRFLOW_HOME=$(pwd)
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
-# Using hardcoded Azure MySQL connection (configured in airflow.cfg)
-# Can override with: export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="mysql+pymysql://..."
 airflow webserver --port 8081
 ```
 
@@ -65,8 +63,6 @@ cd /Users/theepak/Desktop/torroairflow/airflow
 source venv/bin/activate
 export AIRFLOW_HOME=$(pwd)
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
-# Using hardcoded Azure MySQL connection (configured in airflow.cfg)
-# Can override with: export AIRFLOW__DATABASE__SQL_ALCHEMY_CONN="mysql+pymysql://..."
 airflow scheduler
 ```
 
